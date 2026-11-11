@@ -265,8 +265,9 @@ struct UsageSection: View {
         let measured = linked + unlinked + system
         let loose = max(0, (state.usage.rootTotal ?? measured) - measured)
         let used = state.ssdSpace.map { $0.total - $0.free }
-        let orphans = es.filter { $0.kind == .unlinked }
-        let staleCount = es.filter(\.stale).count
+        // Only folders big enough to matter; tiny leftovers (a few KB) are noise.
+        let orphans = es.filter { $0.kind == .unlinked && ($0.bytes ?? 0) >= 100_000_000 }
+        let staleCount = es.filter { $0.stale && ($0.bytes ?? 0) >= 100_000_000 }.count
 
         VStack(alignment: .leading, spacing: 6) {
             HStack {
