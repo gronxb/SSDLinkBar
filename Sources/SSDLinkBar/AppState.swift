@@ -25,32 +25,44 @@ final class AppState: ObservableObject {
     @Published var progressFraction: Double?
     @Published var lastMessage: String?
     @Published var lastError: String?
-    @Published var usage = UsageSnapshot()
-    @Published var scanningUsage = false
-    @Published var remeasured: Set<String> = []
-
-    var ssdEntries: [SSDEntry] {
-        Inventory.entries(snapshot: usage, links: links, remeasured: scanningUsage ? remeasured : nil)
-    }
+    @Published private(set) var usage = UsageSnapshot()
+    @Published private(set) var scanningUsage = false
+    @Published private(set) var ssdEntries: [SSDEntry] = []
+    private var remeasured: Set<String> = []
+    private let scanProcess = ProcessBox()
 
     var volumeName: String { Volume.name(volume) }
 
-    /// Re-measure the whole volume with du (in the background). Skips if a recent complete scan exists unless forced.
-    func scanUsage(force: Bool = false) {
+    /// Rebuilds the usage list. Lists the volume root and stats each top-level entry, so it runs only when
+    /// its inputs change, never from a view body.
+    private func rebuildEntries() {
+        ssdEntries = Inventory.entries(snapshot: usage, links: links, remeasured: scanningUsage ? remeasured : nil)
+    }
+
+    /// Size of a link target from the last volume scan, when the target is a top-level folder of the volume.
+    func snapshotSize(_ target: String) -> Int64? { usage.sizes[target] }
+
+    /// Re-measure the whole volume with du. Only ever started by the user: on a large volume this walks every inode.
+    func scanUsage() {
         guard !scanningUsage, let root = volume, Disk.isMounted(root) else { return }
-        if !force, usage.complete, let t = usage.scannedAt, Date().timeIntervalSince(t) < Inventory.rescanInterval { return }
         scanningUsage = true
         remeasured = []
-        Task.detached(priority: .utility) {
-            let r = Inventory.scan(root: root) { path, bytes in
+        rebuildEntries()
+        let before = usage   // restored if the scan is stopped or fails, so a partial walk never replaces good data
+        let box = scanProcess
+        Task.detached(priority: .background) {
+            let r = Inventory.scan(root: root, box: box) { path, bytes in
                 Task { @MainActor in
-                    guard self.volume == root else { return }
+                    guard self.scanningUsage, self.volume == root else { return }
                     self.usage.sizes[path] = bytes; self.remeasured.insert(path)
+                    self.rebuildEntries()
                 }
             }
             await MainActor.run {
                 self.scanningUsage = false
+                defer { self.rebuildEntries() }
                 guard self.volume == root else { return }   // volume changed while scanning: discard
+                guard r.ok else { self.usage = before; return }   // stopped, unplugged or du failed: keep last result
                 if let t = r.total { self.usage.rootTotal = t }
                 self.usage.volume = root
                 self.usage.scannedAt = Date()
@@ -63,13 +75,17 @@ final class AppState: ObservableObject {
         }
     }
 
+    func cancelScan() { scanProcess.terminate() }
+
     /// Switch to another volume root: reset per-volume state and reload its cached usage.
     private func applyVolume(_ root: String?) {
         guard root != volume else { return }
+        scanProcess.terminate()
         volume = root
         usage = Inventory.loadCache(root: root)
         sizes = [:]
         remeasured = []
+        rebuildEntries()
     }
 
     /// Called from the picker shown when no volume is configured.
@@ -77,7 +93,6 @@ final class AppState: ObservableObject {
         do {
             applyVolume(try Volume.set(path))
             refresh()
-            scanUsage()
         } catch {
             alert("볼륨을 설정할 수 없습니다", error.localizedDescription)
         }
@@ -86,8 +101,9 @@ final class AppState: ObservableObject {
     @Published var loginStatusText = ""
 
     private var observers: [NSObjectProtocol] = []
-    private var timer: Timer?
     private var refreshing = false
+    private var refreshPending = false
+    private var sigterm: DispatchSourceSignal?
 
     var hasWarning: Bool {
         !ssdMounted || links.contains { $0.status != .ok }
@@ -103,17 +119,23 @@ final class AppState: ObservableObject {
                 Task { @MainActor in self?.refresh() }
             })
         }
-        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refresh(); self?.scanUsage() }
-        }
+        // No polling timer: mount/unmount/wake notifications and opening the panel are the only refresh triggers.
+        // Never leave a du walking the volume after the app goes away (quit, or `pkill` from build.sh).
+        let box = scanProcess
+        observers.append(NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: nil) { _ in box.terminate() })
+        signal(SIGTERM, SIG_IGN)
+        let term = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        term.setEventHandler { box.terminate(); exit(0) }
+        term.resume()
+        sigterm = term
         updateLoginStatus()
         applyVolume(Volume.resolve())
         refresh()
-        scanUsage()
     }
 
     func refresh() {
-        guard !refreshing else { return }
+        guard !refreshing else { refreshPending = true; return }
         refreshing = true
         Task.detached(priority: .userInitiated) {
             let root = Volume.resolve()   // re-read each time so `ssdlink volume` changes are picked up
@@ -123,28 +145,30 @@ final class AppState: ObservableObject {
             let i = Disk.internalSpace()
             let s = Disk.ssdSpace(root)
             await MainActor.run {
-                let changed = root != self.volume
                 self.applyVolume(root)
-                self.volumeCandidates = candidates
-                self.ssdMounted = mounted
-                self.links = links
-                self.internalSpace = i
-                self.ssdSpace = s
+                // Assign only what changed so an idle refresh does not republish and redraw everything.
+                if self.volumeCandidates != candidates { self.volumeCandidates = candidates }
+                if self.ssdMounted != mounted { self.ssdMounted = mounted }
+                if self.internalSpace != i { self.internalSpace = i }
+                if self.ssdSpace != s { self.ssdSpace = s }
+                if self.links != links { self.links = links }
+                self.rebuildEntries()
                 self.refreshing = false
-                if changed { self.scanUsage() }
+                if self.refreshPending { self.refreshPending = false; self.refresh() }
             }
         }
     }
 
     // MARK: Sizes
 
-    func computeSize(_ link: LinkInfo, force: Bool = false) {
+    /// Measures one link target with du. Only on request: targets can be hundreds of GB.
+    func computeSize(_ link: LinkInfo) {
         let key = link.target
-        if !force, let cur = sizes[key], cur != .failed { return }
+        if sizes[key] == .computing { return }
         guard link.status == .ok else { return }
         sizes[key] = .computing
-        Task.detached(priority: .utility) {
-            let result = Tree.duSize(key)
+        Task.detached(priority: .background) {
+            let result = Tree.duSize(key, qos: .background)
             await MainActor.run {
                 self.sizes[key] = result.map { .done($0) } ?? .failed
             }
@@ -291,7 +315,6 @@ final class AppState: ObservableObject {
                 switch r {
                 case .success(let t):
                     self.lastMessage = "옮기기 완료: \(Paths.tilde(source)) → \(t)"
-                    self.scanUsage(force: true)
                 case .failure(let e): self.alert("옮기기 실패", e.localizedDescription)
                 }
                 self.refresh()

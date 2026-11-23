@@ -45,7 +45,7 @@ struct LinkInfo: Identifiable, Hashable {
     var displayPath: String { Paths.tilde(path) }
 }
 
-struct VolumeSpace {
+struct VolumeSpace: Equatable {
     let free: Int64
     let total: Int64
 }
@@ -208,11 +208,13 @@ enum Disk {
         return space(root)
     }
 
-    static func format(_ b: Int64) -> String {
+    private static let formatter: ByteCountFormatter = {
         let f = ByteCountFormatter()
         f.countStyle = .file
-        return f.string(fromByteCount: b)
-    }
+        return f
+    }()
+
+    static func format(_ b: Int64) -> String { formatter.string(fromByteCount: b) }
 }
 
 // MARK: - Registry
@@ -303,6 +305,31 @@ enum Discovery {
 
 // MARK: - Tree walking / sizing
 
+/// Holds a running child process so another thread can stop it (scan cancel, volume change, app quit).
+final class ProcessBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var process: Process?
+
+    /// Starts `p` and keeps it until clear(). Returns false if it did not start.
+    func run(_ p: Process) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard (try? p.run()) != nil else { return false }
+        process = p
+        return true
+    }
+
+    func clear(_ p: Process) {
+        lock.lock(); defer { lock.unlock() }
+        if process === p { process = nil }
+    }
+
+    func terminate() {
+        lock.lock(); defer { lock.unlock() }
+        if let p = process, p.isRunning { p.terminate() }
+        process = nil
+    }
+}
+
 enum Tree {
     /// Walks without following symlinks. Counts every entry below root, sums regular file logical sizes.
     static func stats(_ root: String, byteLimit: Int64? = nil, cancel: (() -> Bool)? = nil) -> TreeStats {
@@ -332,10 +359,13 @@ enum Tree {
     }
 
     /// `du -sk` with timeout. Returns allocated bytes, or nil on timeout/failure.
-    static func duSize(_ path: String, timeout: TimeInterval = Config.sizeTimeout) -> Int64? {
+    /// `qos`: .background for the menu bar app (throttled I/O), default for an explicit CLI request.
+    static func duSize(_ path: String, timeout: TimeInterval = Config.sizeTimeout,
+                       qos: QualityOfService = .default) -> Int64? {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/du")
         p.arguments = ["-sk", path]
+        p.qualityOfService = qos
         let out = Pipe()
         p.standardOutput = out
         p.standardError = FileHandle.nullDevice

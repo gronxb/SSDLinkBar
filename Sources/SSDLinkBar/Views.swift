@@ -201,7 +201,14 @@ struct LinkRow: View {
         Group {
             switch state.sizes[link.target] {
             case .none:
-                Text("").onAppear { if link.status == .ok { state.computeSize(link) } }
+                // Sizes are never measured automatically: use the last volume scan, otherwise measure on click.
+                if let b = state.snapshotSize(link.target) {
+                    Text(Disk.format(b)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                        .help("마지막 볼륨 측정 기준")
+                } else if link.status == .ok {
+                    Button("크기 측정") { state.computeSize(link) }
+                        .buttonStyle(.link).font(.caption)
+                }
             case .computing:
                 HStack(spacing: 4) {
                     ProgressView().controlSize(.mini)
@@ -210,7 +217,8 @@ struct LinkRow: View {
             case .done(let b):
                 Text(Disk.format(b)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
             case .failed:
-                Text("크기 확인 불가").font(.caption).foregroundStyle(.secondary)
+                Button("크기 확인 불가 · 다시") { state.computeSize(link) }
+                    .buttonStyle(.link).font(.caption)
             }
         }
     }
@@ -276,13 +284,19 @@ struct UsageSection: View {
                 if state.scanningUsage {
                     ProgressView().controlSize(.mini)
                     Text("측정 중…").font(.caption).foregroundStyle(.secondary)
-                } else if let t = state.usage.scannedAt {
-                    let stale = Inventory.isStale(state.usage)
-                    Text("측정 \(Self.timeFmt.string(from: t)) · \(Self.ago(t))\(state.usage.complete ? "" : " · 일부만")")
-                        .font(.caption).foregroundStyle(.secondary)
-                    if stale { StaleBadge() }
+                    Button("중지") { state.cancelScan() }.buttonStyle(.link).font(.caption)
                 } else {
-                    StaleBadge(text: "측정 전")
+                    if let t = state.usage.scannedAt {
+                        Text("측정 \(Self.timeFmt.string(from: t)) · \(Self.ago(t))\(state.usage.complete ? "" : " · 일부만")")
+                            .font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        StaleBadge(text: "측정 전")
+                    }
+                    if state.ssdMounted {
+                        Button(state.usage.scannedAt == nil ? "측정" : "다시 측정") { state.scanUsage() }
+                            .buttonStyle(.link).font(.caption)
+                            .help("볼륨 전체를 du로 측정합니다. 파일이 많으면 오래 걸립니다.")
+                    }
                 }
             }
             if !state.ssdMounted {
@@ -304,7 +318,7 @@ struct UsageSection: View {
                     }
                 }
                 if staleCount > 0 && !Inventory.isStale(state.usage) {
-                    Text("\(staleCount)개 폴더가 측정 후 바뀜 · 다음 측정 때 갱신").font(.caption2).foregroundStyle(.orange)
+                    Text("\(staleCount)개 폴더가 측정 후 바뀜 · 다시 측정하면 갱신").font(.caption2).foregroundStyle(.orange)
                 }
                 if !orphans.isEmpty {
                     Text("링크 없는 폴더 (\(orphans.count))").font(.caption.bold()).padding(.top, 4)

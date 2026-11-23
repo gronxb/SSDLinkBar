@@ -41,7 +41,6 @@ enum Inventory {
     static let systemNames: Set<String> = [".Spotlight-V100", ".fseventsd", ".DocumentRevisions-V100",
                                            ".Trashes", ".TemporaryItems", ".DS_Store"]
     static let cacheFile = Config.registryDir + "/ssd-usage.json"
-    static let rescanInterval: TimeInterval = 30 * 60
 
     /// Cached snapshot for `root`; empty when the cache belongs to another volume.
     static func loadCache(root: String?) -> UsageSnapshot {
@@ -76,10 +75,10 @@ enum Inventory {
         return .unlinked
     }
 
-    /// Overall staleness: never scanned, last scan incomplete, or older than the rescan interval.
+    /// Overall staleness: never scanned, or the last scan did not finish. Age alone is shown, not flagged,
+    /// because scans only run when the user asks for one.
     static func isStale(_ s: UsageSnapshot) -> Bool {
-        guard s.complete, let t = s.scannedAt else { return true }
-        return Date().timeIntervalSince(t) > rescanInterval
+        !(s.complete && s.scannedAt != nil)
     }
 
     static func modified(_ p: String) -> Date? {
@@ -106,15 +105,17 @@ enum Inventory {
     }
 
     /// Runs du over the volume root and reports each finished top-level folder as it comes in.
-    /// Blocking; call from a background task.
-    static func scan(root: String, onEntry: @escaping (String, Int64) -> Void) -> (total: Int64?, ok: Bool) {
+    /// Blocking; call from a background task. `box` holds the du process so it can be stopped (cancel, quit).
+    static func scan(root: String, box: ProcessBox, onEntry: @escaping (String, Int64) -> Void) -> (total: Int64?, ok: Bool) {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/du")
         p.arguments = ["-k", "-x", "-d", "1", root]
+        p.qualityOfService = .background   // efficiency cores + throttled disk I/O
         let out = Pipe()
         p.standardOutput = out
         p.standardError = FileHandle.nullDevice   // unreadable system folders just get skipped
-        guard (try? p.run()) != nil else { return (nil, false) }
+        guard box.run(p) else { return (nil, false) }
+        defer { box.clear(p) }
 
         var buffer = Data()
         var total: Int64?
